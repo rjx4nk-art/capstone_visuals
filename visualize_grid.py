@@ -36,7 +36,6 @@ from matplotlib.colorbar import ColorbarBase
 from matplotlib.lines import Line2D
 import imageio
 from PIL import Image
-import contextily as ctx
 
 warnings.filterwarnings('ignore')
 
@@ -196,34 +195,10 @@ def extract_substations(nodes):
     return s.reset_index(drop=True)
 
 
-# ─── Step 6: Fetch CartoDB Positron basemap tiles (once) ─────────────────────
-def load_basemap(nodes_3857, pad_frac=0.08):
-    """
-    Fetch CartoDB Positron tiles for the network extent.
-    Falls back to OpenStreetMap.Mapnik, then plain white.
-    Returns (img_array, [west, east, south, north]) in EPSG:3857.
-    """
-    xs = nodes_3857.geometry.x
-    ys = nodes_3857.geometry.y
-    dx, dy = xs.max() - xs.min(), ys.max() - ys.min()
-    w = xs.min() - dx * pad_frac
-    e = xs.max() + dx * pad_frac
-    s = ys.min() - dy * pad_frac
-    n = ys.max() + dy * pad_frac
-
-    for provider, name in [
-        (ctx.providers.CartoDB.Positron,       'CartoDB Positron'),
-        (ctx.providers.OpenStreetMap.Mapnik,   'OpenStreetMap Mapnik'),
-    ]:
-        try:
-            img, ext = ctx.bounds2img(w, s, e, n, zoom=13, source=provider)
-            print(f'  Basemap: {name}  ({img.shape[1]}×{img.shape[0]} px)')
-            return img, list(ext)   # ext = (west, east, south, north)
-        except Exception as ex:
-            print(f'  {name} failed: {ex}')
-
-    print('  Basemap: plain white (no tiles available)')
-    return None, [w, e, s, n]
+# Map background color — warm cream, echoes OSM Positron palette
+MAP_BG      = '#f5f1e8'
+# Phantom "street" color — all edges drawn once as a ghost layer
+STREET_CLR  = '#ccc9be'
 
 
 def map_xlim_ylim(nodes_3857, pad_frac=0.05):
@@ -234,22 +209,20 @@ def map_xlim_ylim(nodes_3857, pad_frac=0.05):
             (ys.min() - dy*pad_frac, ys.max() + dy*pad_frac))
 
 
-def setup_map_ax(ax, xlim, ylim, basemap_img, basemap_ext):
-    ax.set_facecolor('white')
+def setup_map_ax(ax, xlim, ylim):
+    """Configure a clean map axis with warm-cream background."""
+    ax.set_facecolor(MAP_BG)
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     ax.set_aspect('equal')
     ax.axis('off')
-    if basemap_img is not None:
-        ax.imshow(basemap_img, extent=basemap_ext, origin='upper',
-                  zorder=0, interpolation='bilinear')
 
 
 def fig_to_rgb(fig):
     """Convert a matplotlib figure to an H×W×3 uint8 array (even dimensions)."""
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                facecolor='white')
+                facecolor=MAP_BG)
     buf.seek(0)
     img = Image.open(buf).convert('RGB')
     arr = np.array(img)
@@ -260,109 +233,156 @@ def fig_to_rgb(fig):
 
 
 # ─── Output 1: Animated difference map (7 days × 24 hours = 168 frames) ───────
-def make_diff_animation(seg_map_3857, subs_3857, basemap_img, basemap_ext,
-                        loads_ctrl, loads_tempo, xlim, ylim):
+def make_diff_animation(seg_map_3857, subs_3857, loads_ctrl, loads_tempo,
+                        xlim, ylim):
+    """
+    Each frame:
+      • Warm-cream background  (mimics OSM Positron palette)
+      • Ghost street layer     — entire network in light warm gray (lw=0.35)
+                                 Distribution lines follow streets → reads as a
+                                 street map with no external tile download needed.
+      • Per-substation glow    — 3-layer LineCollection (wide glow / mid glow /
+                                 core line) colored by Tempo−Control difference.
+                                 Glow intensity (alpha) scales with |diff|.
+      • Fixed-size substation  — constant s=240, colored by diff, white halo.
+    """
     print('\n[1/3] Building difference animation (168 frames)…')
 
-    regions = list(seg_map_3857.keys())
+    regions = sorted(seg_map_3857.keys())
 
-    # Global diff range across all 168 frames → fixed colorbar
-    all_diffs = []
-    for date in DAYS:
-        for hr in range(1, 25):
-            lc = loads_ctrl[date][hr]
-            lt = loads_tempo[date][hr]
-            for r in regions:
-                all_diffs.append(lt.get(r, 0) - lc.get(r, 0))
-    abs_max = max(abs(v) for v in all_diffs) or 1.0
-    norm = mcolors.TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+    # ── Global diff range (fixed colorbar across all 168 frames) ────────────
+    all_diffs = np.array([
+        loads_tempo[d][h].get(r, 0) - loads_ctrl[d][h].get(r, 0)
+        for d in DAYS for h in range(1, 25) for r in regions
+    ])
+    abs_max = float(np.abs(all_diffs).max()) or 1.0
+    norm    = mcolors.TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
 
-    # Pre-compute all edge segments as a single LineCollection per region
-    # We'll just store the segs; the collection is rebuilt each frame because
-    # the colors change.
-    all_segs = []
-    for r in regions:
-        all_segs.extend(seg_map_3857[r])
+    # ── Pre-compute segment list and which region each segment belongs to ────
+    all_segs    = []
+    seg_reg_idx = []   # index into `regions` list
+    for ri, r in enumerate(regions):
+        for seg in seg_map_3857[r]:
+            all_segs.append(seg)
+            seg_reg_idx.append(ri)
+    seg_reg_idx = np.array(seg_reg_idx, dtype=int)   # shape: (N_segs,)
+    n_segs      = len(all_segs)
+    print(f'  {n_segs:,} edge segments across {len(regions)} substations')
 
-    # Figure layout: map | colorbar
-    fig = plt.figure(figsize=(14, 9), facecolor='white')
+    # ── Substation coordinates (fixed) ──────────────────────────────────────
+    subs_idx = subs_3857.set_index('region')
+    xs_s = np.array([subs_idx.loc[r, 'x'] for r in regions])
+    ys_s = np.array([subs_idx.loc[r, 'y'] for r in regions])
+
+    # ── Figure layout: wide map | narrow colorbar ────────────────────────────
+    fig = plt.figure(figsize=(14, 9), facecolor=MAP_BG)
     gs  = gridspec.GridSpec(1, 2, figure=fig,
-                            width_ratios=[1, 0.03],
+                            width_ratios=[1, 0.028],
                             left=0.01, right=0.94,
                             top=0.90, bottom=0.04,
-                            wspace=0.03)
+                            wspace=0.025)
     ax  = fig.add_subplot(gs[0])
     cax = fig.add_subplot(gs[1])
 
     cb = ColorbarBase(cax, cmap=CMAP_DIFF, norm=norm, orientation='vertical')
-    cb.set_label('Load difference: Tempo − Control (kWh)', fontsize=9)
+    cb.set_label('Tempo − Control  (kWh)', fontsize=9, labelpad=6)
     cb.ax.yaxis.set_tick_params(labelsize=8)
-    cb.ax.set_facecolor('white')
-    # Annotate extremes
-    cax.text(0.5, 1.02, '▲ Tempo\nincreases\nload', transform=cax.transAxes,
-             ha='center', va='bottom', fontsize=7, color='#b2182b')
-    cax.text(0.5, -0.02, '▼ Tempo\nreduces\nload', transform=cax.transAxes,
-             ha='center', va='top', fontsize=7, color='#2166ac')
+    cb.ax.set_facecolor(MAP_BG)
+    cax.text(0.5,  1.025, 'Load\nincrease', transform=cax.transAxes,
+             ha='center', va='bottom', fontsize=7, color='#b2182b',
+             linespacing=1.3)
+    cax.text(0.5, -0.025, 'Load\nreduction', transform=cax.transAxes,
+             ha='center', va='top',    fontsize=7, color='#2166ac',
+             linespacing=1.3)
 
-    # Bottom caption
-    fig.text(0.02, 0.01,
-             'Network edges shown for topology only.  '
-             'Substation circle size ∝ |Δload|.  '
-             'Red = tempo-shifting increases load.  Blue = tempo-shifting reduces load.',
-             fontsize=7.5, color='#555555', va='bottom')
+    fig.text(0.03, 0.012,
+             'Distribution network overlaid on geographic extent.  '
+             'Substation dot color = Tempo − Control difference.  '
+             'Glow intensity ∝ |difference|.',
+             fontsize=7.5, color='#777', va='bottom')
 
-    frames = []
+    # ── Ghost "street" layer — drawn ONCE, never cleared ─────────────────────
+    # This is a static LineCollection added directly to the axes at z=1.
+    # It stays across ax.cla() because we only clear and redraw the dynamic
+    # elements (glow layers + substation dots + title) manually below.
+    # We handle this by NOT calling ax.cla() — instead we remove and re-add
+    # only the dynamic artists.
+    setup_map_ax(ax, xlim, ylim)
+    ghost_lc = LineCollection(all_segs,
+                              colors=STREET_CLR, linewidths=0.35, alpha=0.80,
+                              capstyle='round', zorder=1)
+    ax.add_collection(ghost_lc)
+
+    # Create title Text objects ONCE; update text/color each frame in-place
+    sup_txt = fig.suptitle('', fontsize=13, fontweight='bold',
+                           color='#111111', y=0.965)
+    ttl_txt = ax.set_title('', fontsize=10, pad=5, loc='left')
+
+    # Removable dynamic artists (LineCollections + scatter)
+    dynamic_artists = []
+
+    frames  = []
     frame_n = 0
+
     for date in DAYS:
-        day_type = DAY_TYPE[date]
-        day_type_str = {'red': 'Red Day  (tempo-shifting active)',
-                        'white': 'White Day  (baseline)',
-                        'blue': 'Blue Day  (baseline)'}[day_type]
-        badge_color = {'red': '#e6550d', 'white': '#636363', 'blue': '#3182bd'}[day_type]
+        day_type  = DAY_TYPE[date]
+        day_str   = {'red':   'Red Day  —  tempo-shifting active',
+                     'white': 'White Day  —  baseline',
+                     'blue':  'Blue Day  —  baseline'}[day_type]
+        badge_clr = {'red': '#c0392b', 'white': '#555555',
+                     'blue': '#1a6fad'}[day_type]
 
         for hr in range(1, 25):
-            lc = loads_ctrl[date][hr]
-            lt = loads_tempo[date][hr]
+            lc_data = loads_ctrl [date][hr]
+            lt_data = loads_tempo[date][hr]
 
-            ax.cla()
-            setup_map_ax(ax, xlim, ylim, basemap_img, basemap_ext)
+            # ── Remove previous dynamic artists ─────────────────────────────
+            for art in dynamic_artists:
+                art.remove()
+            dynamic_artists.clear()
 
-            # ── Network edges: thin, neutral, topology-only ──────────────────
-            lc_edges = LineCollection(
-                all_segs,
-                colors=EDGE_COLOR, linewidths=0.45, alpha=0.45,
-                capstyle='round', joinstyle='round', zorder=2
-            )
-            ax.add_collection(lc_edges)
+            # ── Per-segment colors  (vectorized) ────────────────────────────
+            diff_by_region = np.array(
+                [lt_data.get(r, 0) - lc_data.get(r, 0) for r in regions]
+            )                                                   # shape: (21,)
+            diff_per_seg   = diff_by_region[seg_reg_idx]       # shape: (N,)
+            rgba           = CMAP_DIFF(norm(diff_per_seg))     # (N, 4)
 
-            # ── Substation dots: large, colored by difference ────────────────
-            diff_vals = np.array([lt.get(r, 0) - lc.get(r, 0) for r in regions])
-            colors    = CMAP_DIFF(norm(diff_vals))
+            # pulse ∈ [0.25, 1.0] — drives glow intensity
+            pulse = 0.25 + 0.75 * np.abs(diff_per_seg) / abs_max
 
-            xs_s = subs_3857.set_index('region').loc[regions, 'x'].values
-            ys_s = subs_3857.set_index('region').loc[regions, 'y'].values
+            # Wide outer glow  — soft halo
+            wide_c       = rgba.copy(); wide_c[:, 3] = pulse * 0.10
+            lc_wide = LineCollection(all_segs, colors=wide_c,
+                                     linewidths=18, capstyle='round', zorder=2)
+            # Mid glow
+            mid_c        = rgba.copy(); mid_c[:, 3]  = pulse * 0.25
+            lc_mid  = LineCollection(all_segs, colors=mid_c,
+                                     linewidths=6,  capstyle='round', zorder=3)
+            # Core line
+            core_c       = rgba.copy()
+            core_c[:, 3] = np.clip(pulse * 0.95, 0.55, 0.95)
+            lc_core = LineCollection(all_segs, colors=core_c,
+                                     linewidths=1.4, capstyle='round', zorder=4)
 
-            # Size proportional to |diff|, with a minimum for visibility
-            max_diff = abs_max if abs_max > 0 else 1
-            sizes = 120 + 300 * (np.abs(diff_vals) / max_diff)
+            ax.add_collection(lc_wide)
+            ax.add_collection(lc_mid)
+            ax.add_collection(lc_core)
+            dynamic_artists += [lc_wide, lc_mid, lc_core]
 
-            # Outer white halo for contrast against basemap
-            ax.scatter(xs_s, ys_s, s=sizes + 80, c='white',
-                       zorder=4, linewidths=0)
-            # Colored circle
-            ax.scatter(xs_s, ys_s, s=sizes, c=colors,
-                       zorder=5, linewidths=1.0,
-                       edgecolors='#444444')
+            # ── Substation dots: FIXED size, colored by diff ─────────────────
+            sub_colors = CMAP_DIFF(norm(diff_by_region))   # (21, 4)
 
-            # ── Title ────────────────────────────────────────────────────────
-            fig.suptitle(
-                f'{DAY_LABEL[date]}   |   Hour {hr:02d}:00',
-                fontsize=13, fontweight='bold', color='#111111',
-                y=0.96
-            )
-            # Day-type badge
-            ax.set_title(day_type_str, fontsize=10, color=badge_color,
-                         pad=4, loc='left')
+            halo = ax.scatter(xs_s, ys_s, s=390, c='white',
+                              zorder=6, linewidths=0)
+            dot  = ax.scatter(xs_s, ys_s, s=260, c=sub_colors,
+                              zorder=7, edgecolors='#222222', linewidths=0.9)
+            dynamic_artists += [halo, dot]
+
+            # ── Update labels in-place ────────────────────────────────────────
+            sup_txt.set_text(f'{DAY_LABEL[date]}   |   Hour  {hr:02d}:00')
+            ttl_txt.set_text(day_str)
+            ttl_txt.set_color(badge_clr)
 
             frames.append(fig_to_rgb(fig))
             frame_n += 1
@@ -634,24 +654,22 @@ def main():
     loads_ctrl  = compute_loads(nodes, ctrl_df)
     loads_tempo = compute_loads(nodes, tempo_df)
 
-    # Reproject to Web Mercator (EPSG:3857) for basemap overlay
+    # Reproject to Web Mercator (EPSG:3857) so geometry is in metres
     print('\nReprojecting network to EPSG:3857…')
     nodes_3857 = nodes.to_crs('EPSG:3857')
     edges_3857 = edges.to_crs('EPSG:3857')
 
-    seg_map_3857  = build_edge_segments(edges_3857)
-    subs_3857     = extract_substations(nodes_3857)
-    xlim, ylim    = map_xlim_ylim(nodes_3857)
+    seg_map_3857 = build_edge_segments(edges_3857)
+    subs_3857    = extract_substations(nodes_3857)
+    xlim, ylim   = map_xlim_ylim(nodes_3857)
 
-    print('\nFetching basemap tiles…')
-    basemap_img, basemap_ext = load_basemap(nodes_3857)
-
-    print(f'\nMap extent (EPSG:3857):  '
+    print(f'  Map extent (EPSG:3857):  '
           f'x [{xlim[0]:.0f}, {xlim[1]:.0f}]  '
           f'y [{ylim[0]:.0f}, {ylim[1]:.0f}]')
+    print('  Background: phantom street layer from distribution network geometry')
 
     # ── Generate outputs ─────────────────────────────────────────────────────
-    make_diff_animation(seg_map_3857, subs_3857, basemap_img, basemap_ext,
+    make_diff_animation(seg_map_3857, subs_3857,
                         loads_ctrl, loads_tempo, xlim, ylim)
 
     make_substation_profiles(subs_3857, loads_ctrl, loads_tempo)
