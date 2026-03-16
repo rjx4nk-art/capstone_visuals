@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Distribution Network Load Visualization
-========================================
+Distribution Network Load Visualization — Publication Quality
+=============================================================
 Produces:
   output/
-    01_red_day_animation.mp4        — control vs tempo, red day (24 hrs, side-by-side)
-    02_daily_totals_animation.mp4   — daily total load comparison (7 frames, side-by-side)
-    03_snapshot_peak.png            — static: peak-load hour on the red day
-    04_snapshot_offpeak.png         — static: off-peak hour on the red day
-    05_difference_map.png           — tempo minus control at peak hour (diverging colormap)
-    06_substation_profiles.png      — 24h load curves per substation, red day
+    01_diff_animation.mp4      — Animated tempo-minus-control difference map
+                                 7 days × 24 hours (168 frames)
+                                 CartoDB Positron basemap, large substation
+                                 markers, thin tree-network spindles
+    02_substation_profiles.png — 24h load profiles per substation, Red Day
+                                 (the day tempo-shifting was active)
+    03_system_profiles.png     — System-total 24h profiles, 3 panels:
+                                 Red Day / White Day / Blue-day average
 
-Data: control_profile.csv and tempo_shifted_profile.csv in data/
+Data: data/control_profile.csv and data/tempo_shifted_profile.csv
       28,195 unique HIDs across 21 substations, 7 days (Jul 1-7 2014)
 """
 
 import os
 import zipfile
 import warnings
+import io
+
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -26,11 +30,13 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 from matplotlib.collections import LineCollection
 from matplotlib.colorbar import ColorbarBase
+from matplotlib.lines import Line2D
 import imageio
 from PIL import Image
-import io
+import contextily as ctx
 
 warnings.filterwarnings('ignore')
 
@@ -43,47 +49,56 @@ EXTRACT_DIR = '/tmp/dist_net'
 OUTPUT_DIR  = os.path.join(BASE_DIR, 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ─── Visual constants ─────────────────────────────────────────────────────────
-BG_COLOR    = '#06090f'    # deep navy-black background
-PANEL_SEP   = '#10192a'    # slightly lighter for dividers
-TEXT_COLOR  = '#c8d8e8'    # cool-white text
-DIM_COLOR   = '#2a3f55'    # muted blue for borders / grid
-CMAP_LOAD   = mcolors.LinearSegmentedColormap.from_list(
-    'load', ['#00e676', '#ffe000', '#ff1744'], N=512)
-CMAP_DIFF   = mcolors.LinearSegmentedColormap.from_list(
-    'diff', ['#1565c0', '#e0e0e0', '#c62828'], N=512)
-
-# Matplotlib style
-plt.rcParams.update({
-    'figure.facecolor':  BG_COLOR,
-    'axes.facecolor':    BG_COLOR,
-    'text.color':        TEXT_COLOR,
-    'axes.labelcolor':   TEXT_COLOR,
-    'xtick.color':       TEXT_COLOR,
-    'ytick.color':       TEXT_COLOR,
-    'axes.edgecolor':    DIM_COLOR,
-    'font.family':       'monospace',
-    'font.size':         9,
-})
-
+# ─── Day definitions ──────────────────────────────────────────────────────────
 HOUR_COLS = [str(i) for i in range(1, 25)]
-
-DAYS      = ['2014-07-01','2014-07-02','2014-07-03','2014-07-04',
-             '2014-07-05','2014-07-06','2014-07-07']
-DAY_COLOR = {'2014-07-01':'blue','2014-07-02':'white','2014-07-03':'red',
-             '2014-07-04':'blue','2014-07-05':'blue','2014-07-06':'blue',
-             '2014-07-07':'blue'}
-DAY_LABEL = {
-    '2014-07-01': 'Day 1  Tue Jul 1  [blue]',
-    '2014-07-02': 'Day 2  Wed Jul 2  [white]',
-    '2014-07-03': 'Day 3  Thu Jul 3  [red]',
-    '2014-07-04': 'Day 4  Fri Jul 4  [blue]',
-    '2014-07-05': 'Day 5  Sat Jul 5  [blue]',
-    '2014-07-06': 'Day 6  Sun Jul 6  [blue]',
-    '2014-07-07': 'Day 7  Mon Jul 7  [blue]',
-}
+DAYS      = ['2014-07-01','2014-07-02','2014-07-03',
+             '2014-07-04','2014-07-05','2014-07-06','2014-07-07']
+DAY_TYPE  = {d: 'blue' for d in DAYS}
+DAY_TYPE['2014-07-02'] = 'white'
+DAY_TYPE['2014-07-03'] = 'red'
 RED_DAY   = '2014-07-03'
 WHITE_DAY = '2014-07-02'
+BLUE_DAYS = [d for d in DAYS if DAY_TYPE[d] == 'blue']
+
+DAY_LABEL = {
+    '2014-07-01': 'Day 1  Tue 1 Jul  [Blue]',
+    '2014-07-02': 'Day 2  Wed 2 Jul  [White]',
+    '2014-07-03': 'Day 3  Thu 3 Jul  [Red — tempo active]',
+    '2014-07-04': 'Day 4  Fri 4 Jul  [Blue]',
+    '2014-07-05': 'Day 5  Sat 5 Jul  [Blue]',
+    '2014-07-06': 'Day 6  Sun 6 Jul  [Blue]',
+    '2014-07-07': 'Day 7  Mon 7 Jul  [Blue]',
+}
+
+# Publication-quality color palette (ColorBrewer / scientific)
+CTRL_COLOR  = '#2166AC'   # Dark blue — control scenario
+TEMPO_COLOR = '#D6604D'   # Warm red-orange — tempo-shifted scenario
+FILL_POS    = '#f4a582'   # Light coral  (tempo > ctrl)
+FILL_NEG    = '#92c5de'   # Light sky-blue (tempo < ctrl)
+EDGE_COLOR  = '#707070'   # Neutral gray for network edges
+CMAP_DIFF   = plt.cm.RdBu_r  # Diverging: blue=decrease, red=increase
+
+# Matplotlib global style — clean, academic
+plt.rcParams.update({
+    'font.family':        'DejaVu Sans',
+    'font.size':          10,
+    'axes.titlesize':     12,
+    'axes.labelsize':     10,
+    'xtick.labelsize':    9,
+    'ytick.labelsize':    9,
+    'axes.spines.top':    False,
+    'axes.spines.right':  False,
+    'figure.facecolor':   'white',
+    'axes.facecolor':     'white',
+    'axes.grid':          True,
+    'grid.color':         '#e0e0e0',
+    'grid.linewidth':     0.6,
+    'text.color':         '#222222',
+    'axes.labelcolor':    '#222222',
+    'xtick.color':        '#444444',
+    'ytick.color':        '#444444',
+    'axes.edgecolor':     '#cccccc',
+})
 
 
 # ─── Step 1: Extract zip ──────────────────────────────────────────────────────
@@ -156,43 +171,15 @@ def compute_loads(nodes, csv_df):
     return result
 
 
-def daily_totals(loads):
-    """Return  totals[date] = {region: sum_over_24h}"""
-    totals = {}
-    for date, hours in loads.items():
-        per_region = {}
-        for hr_dict in hours.values():
-            for reg, v in hr_dict.items():
-                per_region[reg] = per_region.get(reg, 0.0) + v
-        totals[date] = per_region
-    return totals
-
-
-def global_vmin_vmax(*load_dicts):
-    vals = []
-    for ld in load_dicts:
-        for h_dict in ld.values():
-            for v in h_dict.values():
-                vals.extend(v.values())
-    return min(vals), max(vals)
-
-
-def global_daily_vmin_vmax(*total_dicts):
-    vals = []
-    for td in total_dicts:
-        for v in td.values():
-            vals.extend(v.values())
-    return min(vals), max(vals)
-
-
-# ─── Step 5: Pre-compute edge geometry segments ───────────────────────────────
+# ─── Step 5: Pre-compute edge geometry segments (in projected CRS) ────────────
 def build_edge_segments(edges):
     """Return  {region: list_of_coord_arrays}"""
     seg_map = {}
     for region, grp in edges.groupby('region'):
         segs = []
         for geom in grp.geometry:
-            if geom is None: continue
+            if geom is None:
+                continue
             if geom.geom_type == 'LineString':
                 segs.append(np.array(geom.coords))
             elif geom.geom_type == 'MultiLineString':
@@ -203,391 +190,437 @@ def build_edge_segments(edges):
 
 
 def extract_substations(nodes):
-    """Return GeoDataFrame of 'S' nodes (one per region)."""
     s = nodes[nodes['label'] == 'S'].copy()
     s['x'] = s.geometry.x
     s['y'] = s.geometry.y
     return s.reset_index(drop=True)
 
 
-def map_extent(nodes, pad_frac=0.04):
-    xs = nodes.geometry.x
-    ys = nodes.geometry.y
-    dx = xs.max() - xs.min()
-    dy = ys.max() - ys.min()
-    return (xs.min() - dx*pad_frac, xs.max() + dx*pad_frac,
-            ys.min() - dy*pad_frac, ys.max() + dy*pad_frac)
+# ─── Step 6: Fetch CartoDB Positron basemap tiles (once) ─────────────────────
+def load_basemap(nodes_3857, pad_frac=0.08):
+    """
+    Fetch CartoDB Positron tiles for the network extent.
+    Falls back to OpenStreetMap.Mapnik, then plain white.
+    Returns (img_array, [west, east, south, north]) in EPSG:3857.
+    """
+    xs = nodes_3857.geometry.x
+    ys = nodes_3857.geometry.y
+    dx, dy = xs.max() - xs.min(), ys.max() - ys.min()
+    w = xs.min() - dx * pad_frac
+    e = xs.max() + dx * pad_frac
+    s = ys.min() - dy * pad_frac
+    n = ys.max() + dy * pad_frac
+
+    for provider, name in [
+        (ctx.providers.CartoDB.Positron,       'CartoDB Positron'),
+        (ctx.providers.OpenStreetMap.Mapnik,   'OpenStreetMap Mapnik'),
+    ]:
+        try:
+            img, ext = ctx.bounds2img(w, s, e, n, zoom=13, source=provider)
+            print(f'  Basemap: {name}  ({img.shape[1]}×{img.shape[0]} px)')
+            return img, list(ext)   # ext = (west, east, south, north)
+        except Exception as ex:
+            print(f'  {name} failed: {ex}')
+
+    print('  Basemap: plain white (no tiles available)')
+    return None, [w, e, s, n]
 
 
-# ─── Step 6: Rendering primitives ────────────────────────────────────────────
-GLOW_LAYERS = [(10.0, 0.018), (5.0, 0.07), (2.5, 0.18), (1.0, 0.85)]
-
-def draw_glow_edges(ax, segs, color, lw=0.7):
-    if not segs:
-        return
-    for width_mult, alpha in GLOW_LAYERS:
-        lc = LineCollection(segs, colors=[color], linewidths=lw*width_mult,
-                            alpha=alpha, capstyle='round', joinstyle='round',
-                            zorder=3)
-        ax.add_collection(lc)
+def map_xlim_ylim(nodes_3857, pad_frac=0.05):
+    xs = nodes_3857.geometry.x
+    ys = nodes_3857.geometry.y
+    dx, dy = xs.max() - xs.min(), ys.max() - ys.min()
+    return ((xs.min() - dx*pad_frac, xs.max() + dx*pad_frac),
+            (ys.min() - dy*pad_frac, ys.max() + dy*pad_frac))
 
 
-def draw_substation(ax, x, y, color):
-    """Glowing substation node: outer halo → inner bright dot."""
-    for s, a in [(280, 0.04), (120, 0.12), (45, 0.35)]:
-        ax.scatter(x, y, s=s, color=color, alpha=a, zorder=7, linewidths=0)
-    ax.scatter(x, y, s=18, color='white', alpha=0.95, zorder=8, linewidths=0)
-    ax.scatter(x, y, s=7,  color=color,   alpha=1.00, zorder=9, linewidths=0)
-
-
-def setup_map_ax(ax, xlim, ylim):
-    ax.set_facecolor(BG_COLOR)
-    ax.set_xlim(xlim[0], xlim[1])
-    ax.set_ylim(ylim[0], ylim[1])
+def setup_map_ax(ax, xlim, ylim, basemap_img, basemap_ext):
+    ax.set_facecolor('white')
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
     ax.set_aspect('equal')
     ax.axis('off')
-
-    # Subtle lat/lon graticule
-    for lon in np.arange(-76.1, -75.5, 0.1):
-        ax.axvline(lon, color=DIM_COLOR, lw=0.35, alpha=0.5, zorder=1)
-    for lat in np.arange(37.1, 37.7, 0.1):
-        ax.axhline(lat, color=DIM_COLOR, lw=0.35, alpha=0.5, zorder=1)
-
-
-def add_colorbar(fig, ax_or_pos, norm, label, cmap=CMAP_LOAD):
-    cax = fig.add_axes(ax_or_pos)
-    cb  = ColorbarBase(cax, cmap=cmap, norm=norm, orientation='vertical')
-    cb.set_label(label, color=TEXT_COLOR, fontsize=8)
-    cb.ax.yaxis.set_tick_params(color=TEXT_COLOR, labelsize=7)
-    plt.setp(cb.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
-    cax.set_facecolor(BG_COLOR)
-    return cax
-
-
-# ─── Step 7: Render a single side-by-side frame ───────────────────────────────
-def render_side_by_side(fig, ax_ctrl, ax_tempo,
-                        seg_map, substations,
-                        loads_ctrl_frame, loads_tempo_frame,
-                        norm, xlim, ylim,
-                        title_ctrl, title_tempo, main_title):
-    """
-    Fill two axes with the glowing network.
-    loads_ctrl_frame / loads_tempo_frame : {region: load_val}
-    """
-    for ax, loads_frame, panel_title in [
-            (ax_ctrl,  loads_ctrl_frame,  title_ctrl),
-            (ax_tempo, loads_tempo_frame, title_tempo)]:
-        ax.cla()
-        setup_map_ax(ax, xlim, ylim)
-
-        for region, segs in seg_map.items():
-            val   = loads_frame.get(region, 0.0)
-            color = CMAP_LOAD(norm(val))
-            draw_glow_edges(ax, segs, color)
-
-        for _, row in substations.iterrows():
-            val   = loads_frame.get(row['region'], 0.0)
-            color = CMAP_LOAD(norm(val))
-            draw_substation(ax, row['x'], row['y'], color)
-
-        ax.set_title(panel_title, color=TEXT_COLOR, fontsize=9, pad=5,
-                     loc='center')
-
-    fig.suptitle(main_title, color='white', fontsize=11, y=0.97,
-                 fontweight='bold')
+    if basemap_img is not None:
+        ax.imshow(basemap_img, extent=basemap_ext, origin='upper',
+                  zorder=0, interpolation='bilinear')
 
 
 def fig_to_rgb(fig):
     """Convert a matplotlib figure to an H×W×3 uint8 array (even dimensions)."""
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                facecolor=fig.get_facecolor())
+                facecolor='white')
     buf.seek(0)
     img = Image.open(buf).convert('RGB')
     arr = np.array(img)
-    # libx264 requires even width and height
     h, w = arr.shape[:2]
     if h % 2: arr = arr[:-1, :, :]
     if w % 2: arr = arr[:, :-1, :]
     return arr
 
 
-# ─── Output 1: Red-day animation (24 frames) ─────────────────────────────────
-def make_red_day_animation(seg_map, substations, loads_ctrl, loads_tempo,
-                           vmin, vmax, xlim, ylim):
-    print('\n[1/6] Rendering red-day animation (24 frames × 2 panels)…')
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+# ─── Output 1: Animated difference map (7 days × 24 hours = 168 frames) ───────
+def make_diff_animation(seg_map_3857, subs_3857, basemap_img, basemap_ext,
+                        loads_ctrl, loads_tempo, xlim, ylim):
+    print('\n[1/3] Building difference animation (168 frames)…')
 
-    fig = plt.figure(figsize=(18, 8.5), facecolor=BG_COLOR)
-    # layout: [ctrl_map | tempo_map | colorbar]
-    gs  = gridspec.GridSpec(1, 3, figure=fig,
-                            width_ratios=[1, 1, 0.045],
-                            left=0.01, right=0.95,
-                            top=0.91, bottom=0.04,
-                            wspace=0.04)
-    ax_ctrl  = fig.add_subplot(gs[0])
-    ax_tempo = fig.add_subplot(gs[1])
-    cax      = fig.add_subplot(gs[2])
-    cb = ColorbarBase(cax, cmap=CMAP_LOAD, norm=norm, orientation='vertical')
-    cb.set_label('Aggregated load (kWh)', color=TEXT_COLOR, fontsize=8)
-    cb.ax.yaxis.set_tick_params(color=TEXT_COLOR, labelsize=7)
-    plt.setp(cb.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
-    cax.set_facecolor(BG_COLOR)
+    regions = list(seg_map_3857.keys())
 
-    # bottom legend bar
-    fig.text(0.02, 0.01,
-             '● Substation node    — Distribution network edges    '
-             'Colour: green = low load  →  red = high load',
-             color=DIM_COLOR, fontsize=7.5, va='bottom')
-
-    frames = []
-    for hr in range(1, 25):
-        lc = loads_ctrl [RED_DAY][hr]
-        lt = loads_tempo[RED_DAY][hr]
-        render_side_by_side(
-            fig, ax_ctrl, ax_tempo,
-            seg_map, substations, lc, lt, norm, xlim, ylim,
-            title_ctrl  = f'CONTROL  —  {RED_DAY}  hour {hr:02d}:00',
-            title_tempo = f'TEMPO-SHIFTED  —  {RED_DAY}  hour {hr:02d}:00',
-            main_title  = f'Distribution Network Load  |  Red Day ({RED_DAY})  '
-                          f'|  Hour {hr:02d}:00 – {hr:02d}:59'
-        )
-        frames.append(fig_to_rgb(fig))
-        print(f'  hour {hr:02d}', end='\r')
-
-    plt.close(fig)
-
-    out = os.path.join(OUTPUT_DIR, '01_red_day_animation.mp4')
-    imageio.mimwrite(out, frames, fps=4, quality=8, macro_block_size=1)
-    print(f'\n  Saved → {out}')
-
-
-# ─── Output 2: Daily-totals animation (7 frames) ─────────────────────────────
-def make_daily_animation(seg_map, substations, loads_ctrl, loads_tempo,
-                         xlim, ylim):
-    print('\n[2/6] Rendering daily-totals animation (7 frames)…')
-    tot_ctrl  = daily_totals(loads_ctrl)
-    tot_tempo = daily_totals(loads_tempo)
-    vmin, vmax = global_daily_vmin_vmax(tot_ctrl, tot_tempo)
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-    fig = plt.figure(figsize=(18, 8.5), facecolor=BG_COLOR)
-    gs  = gridspec.GridSpec(1, 3, figure=fig,
-                            width_ratios=[1, 1, 0.045],
-                            left=0.01, right=0.95,
-                            top=0.91, bottom=0.04,
-                            wspace=0.04)
-    ax_ctrl  = fig.add_subplot(gs[0])
-    ax_tempo = fig.add_subplot(gs[1])
-    cax      = fig.add_subplot(gs[2])
-    cb = ColorbarBase(cax, cmap=CMAP_LOAD, norm=norm, orientation='vertical')
-    cb.set_label('Daily total load (kWh)', color=TEXT_COLOR, fontsize=8)
-    cb.ax.yaxis.set_tick_params(color=TEXT_COLOR, labelsize=7)
-    plt.setp(cb.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
-    cax.set_facecolor(BG_COLOR)
-
-    fig.text(0.02, 0.01,
-             'Each frame = one calendar day  |  Colour = daily total aggregated load per substation',
-             color=DIM_COLOR, fontsize=7.5, va='bottom')
-
-    frames = []
+    # Global diff range across all 168 frames → fixed colorbar
+    all_diffs = []
     for date in DAYS:
-        tc = tot_ctrl [date]
-        tt = tot_tempo[date]
-        render_side_by_side(
-            fig, ax_ctrl, ax_tempo,
-            seg_map, substations, tc, tt, norm, xlim, ylim,
-            title_ctrl  = f'CONTROL  —  {DAY_LABEL[date]}',
-            title_tempo = f'TEMPO-SHIFTED  —  {DAY_LABEL[date]}',
-            main_title  = f'Daily Total Load  |  {DAY_LABEL[date]}'
-        )
-        frames.append(fig_to_rgb(fig))
-        print(f'  {date}')
+        for hr in range(1, 25):
+            lc = loads_ctrl[date][hr]
+            lt = loads_tempo[date][hr]
+            for r in regions:
+                all_diffs.append(lt.get(r, 0) - lc.get(r, 0))
+    abs_max = max(abs(v) for v in all_diffs) or 1.0
+    norm = mcolors.TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
 
-    plt.close(fig)
+    # Pre-compute all edge segments as a single LineCollection per region
+    # We'll just store the segs; the collection is rebuilt each frame because
+    # the colors change.
+    all_segs = []
+    for r in regions:
+        all_segs.extend(seg_map_3857[r])
 
-    out = os.path.join(OUTPUT_DIR, '02_daily_totals_animation.mp4')
-    imageio.mimwrite(out, frames, fps=1, quality=8, macro_block_size=1)
-    print(f'  Saved → {out}')
-
-
-# ─── Output 3 & 4: Static snapshots (peak / off-peak on red day) ─────────────
-def make_snapshots(seg_map, substations, loads_ctrl, loads_tempo,
-                   vmin, vmax, xlim, ylim):
-    print('\n[3–4/6] Rendering peak / off-peak snapshots…')
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-    # Find peak and off-peak hour for control on red day
-    hour_totals = {hr: sum(loads_ctrl[RED_DAY][hr].values())
-                   for hr in range(1, 25)}
-    peak_hr    = max(hour_totals, key=hour_totals.get)
-    offpeak_hr = min(hour_totals, key=hour_totals.get)
-    print(f'  Peak hour: {peak_hr:02d}:00  |  Off-peak: {offpeak_hr:02d}:00')
-
-    for label, hr, fname in [
-            ('PEAK LOAD', peak_hr,    '03_snapshot_peak.png'),
-            ('OFF-PEAK LOAD', offpeak_hr, '04_snapshot_offpeak.png')]:
-
-        fig = plt.figure(figsize=(18, 8.5), facecolor=BG_COLOR)
-        gs  = gridspec.GridSpec(1, 3, figure=fig,
-                                width_ratios=[1, 1, 0.045],
-                                left=0.01, right=0.95,
-                                top=0.91, bottom=0.07,
-                                wspace=0.04)
-        ax_ctrl  = fig.add_subplot(gs[0])
-        ax_tempo = fig.add_subplot(gs[1])
-        cax      = fig.add_subplot(gs[2])
-        cb = ColorbarBase(cax, cmap=CMAP_LOAD, norm=norm, orientation='vertical')
-        cb.set_label('Aggregated load (kWh)', color=TEXT_COLOR, fontsize=8)
-        cb.ax.yaxis.set_tick_params(color=TEXT_COLOR, labelsize=7)
-        plt.setp(cb.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
-        cax.set_facecolor(BG_COLOR)
-
-        render_side_by_side(
-            fig, ax_ctrl, ax_tempo,
-            seg_map, substations,
-            loads_ctrl [RED_DAY][hr],
-            loads_tempo[RED_DAY][hr],
-            norm, xlim, ylim,
-            title_ctrl  = f'CONTROL  —  {RED_DAY}  hour {hr:02d}:00',
-            title_tempo = f'TEMPO-SHIFTED  —  {RED_DAY}  hour {hr:02d}:00',
-            main_title  = f'Distribution Network Load  |  {label}  '
-                          f'|  {RED_DAY}  hour {hr:02d}:00'
-        )
-
-        out = os.path.join(OUTPUT_DIR, fname)
-        fig.savefig(out, dpi=150, bbox_inches='tight',
-                    facecolor=BG_COLOR)
-        plt.close(fig)
-        print(f'  Saved → {out}')
-
-    return peak_hr
-
-
-# ─── Output 5: Difference map (tempo − control at peak hour) ─────────────────
-def make_difference_map(seg_map, substations, loads_ctrl, loads_tempo,
-                        peak_hr, xlim, ylim):
-    print('\n[5/6] Rendering difference map (tempo − control at peak hour)…')
-
-    lc = loads_ctrl [RED_DAY][peak_hr]
-    lt = loads_tempo[RED_DAY][peak_hr]
-
-    all_diffs = [lt.get(r, 0) - lc.get(r, 0) for r in seg_map]
-    abs_max   = max(abs(v) for v in all_diffs) or 1.0
-    norm      = mcolors.TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
-
-    fig = plt.figure(figsize=(10, 9), facecolor=BG_COLOR)
+    # Figure layout: map | colorbar
+    fig = plt.figure(figsize=(14, 9), facecolor='white')
     gs  = gridspec.GridSpec(1, 2, figure=fig,
-                            width_ratios=[1, 0.05],
-                            left=0.03, right=0.93,
-                            top=0.90, bottom=0.06,
-                            wspace=0.06)
+                            width_ratios=[1, 0.03],
+                            left=0.01, right=0.94,
+                            top=0.90, bottom=0.04,
+                            wspace=0.03)
     ax  = fig.add_subplot(gs[0])
     cax = fig.add_subplot(gs[1])
 
-    setup_map_ax(ax, xlim, ylim)
-
-    for region, segs in seg_map.items():
-        diff  = lt.get(region, 0) - lc.get(region, 0)
-        color = CMAP_DIFF(norm(diff))
-        draw_glow_edges(ax, segs, color)
-
-    for _, row in substations.iterrows():
-        diff  = lt.get(row['region'], 0) - lc.get(row['region'], 0)
-        color = CMAP_DIFF(norm(diff))
-        draw_substation(ax, row['x'], row['y'], color)
-
     cb = ColorbarBase(cax, cmap=CMAP_DIFF, norm=norm, orientation='vertical')
-    cb.set_label('Δ load: tempo − control (kWh)', color=TEXT_COLOR, fontsize=8)
-    cb.ax.yaxis.set_tick_params(color=TEXT_COLOR, labelsize=7)
-    plt.setp(cb.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
-    cax.set_facecolor(BG_COLOR)
+    cb.set_label('Load difference: Tempo − Control (kWh)', fontsize=9)
+    cb.ax.yaxis.set_tick_params(labelsize=8)
+    cb.ax.set_facecolor('white')
+    # Annotate extremes
+    cax.text(0.5, 1.02, '▲ Tempo\nincreases\nload', transform=cax.transAxes,
+             ha='center', va='bottom', fontsize=7, color='#b2182b')
+    cax.text(0.5, -0.02, '▼ Tempo\nreduces\nload', transform=cax.transAxes,
+             ha='center', va='top', fontsize=7, color='#2166ac')
 
-    fig.suptitle(f'Load Difference  |  Tempo-Shifted − Control  '
-                 f'|  {RED_DAY}  hour {peak_hr:02d}:00\n'
-                 'Blue = tempo-shifting reduces load  '
-                 '|  Red = tempo-shifting increases load',
-                 color='white', fontsize=10, fontweight='bold', y=0.97)
+    # Bottom caption
+    fig.text(0.02, 0.01,
+             'Network edges shown for topology only.  '
+             'Substation circle size ∝ |Δload|.  '
+             'Red = tempo-shifting increases load.  Blue = tempo-shifting reduces load.',
+             fontsize=7.5, color='#555555', va='bottom')
 
-    out = os.path.join(OUTPUT_DIR, '05_difference_map.png')
-    fig.savefig(out, dpi=150, bbox_inches='tight', facecolor=BG_COLOR)
+    frames = []
+    frame_n = 0
+    for date in DAYS:
+        day_type = DAY_TYPE[date]
+        day_type_str = {'red': 'Red Day  (tempo-shifting active)',
+                        'white': 'White Day  (baseline)',
+                        'blue': 'Blue Day  (baseline)'}[day_type]
+        badge_color = {'red': '#e6550d', 'white': '#636363', 'blue': '#3182bd'}[day_type]
+
+        for hr in range(1, 25):
+            lc = loads_ctrl[date][hr]
+            lt = loads_tempo[date][hr]
+
+            ax.cla()
+            setup_map_ax(ax, xlim, ylim, basemap_img, basemap_ext)
+
+            # ── Network edges: thin, neutral, topology-only ──────────────────
+            lc_edges = LineCollection(
+                all_segs,
+                colors=EDGE_COLOR, linewidths=0.45, alpha=0.45,
+                capstyle='round', joinstyle='round', zorder=2
+            )
+            ax.add_collection(lc_edges)
+
+            # ── Substation dots: large, colored by difference ────────────────
+            diff_vals = np.array([lt.get(r, 0) - lc.get(r, 0) for r in regions])
+            colors    = CMAP_DIFF(norm(diff_vals))
+
+            xs_s = subs_3857.set_index('region').loc[regions, 'x'].values
+            ys_s = subs_3857.set_index('region').loc[regions, 'y'].values
+
+            # Size proportional to |diff|, with a minimum for visibility
+            max_diff = abs_max if abs_max > 0 else 1
+            sizes = 120 + 300 * (np.abs(diff_vals) / max_diff)
+
+            # Outer white halo for contrast against basemap
+            ax.scatter(xs_s, ys_s, s=sizes + 80, c='white',
+                       zorder=4, linewidths=0)
+            # Colored circle
+            ax.scatter(xs_s, ys_s, s=sizes, c=colors,
+                       zorder=5, linewidths=1.0,
+                       edgecolors='#444444')
+
+            # ── Title ────────────────────────────────────────────────────────
+            fig.suptitle(
+                f'{DAY_LABEL[date]}   |   Hour {hr:02d}:00',
+                fontsize=13, fontweight='bold', color='#111111',
+                y=0.96
+            )
+            # Day-type badge
+            ax.set_title(day_type_str, fontsize=10, color=badge_color,
+                         pad=4, loc='left')
+
+            frames.append(fig_to_rgb(fig))
+            frame_n += 1
+            if hr == 1 or hr % 6 == 0:
+                print(f'  {date}  hour {hr:02d}  [{frame_n}/168]', end='\r')
+
+    plt.close(fig)
+
+    out = os.path.join(OUTPUT_DIR, '01_diff_animation.mp4')
+    imageio.mimwrite(out, frames, fps=4, quality=9, macro_block_size=1)
+    print(f'\n  Saved → {out}  ({len(frames)} frames)')
+
+
+# ─── Output 2: Substation 24h profiles — Red Day small multiples ─────────────
+def make_substation_profiles(substations, loads_ctrl, loads_tempo):
+    """
+    24-hour load profiles for each substation on the Red Day (2014-07-03),
+    the only day when tempo-shifting was active.  Control (solid blue) vs
+    Tempo-shifted (dashed red-orange).
+    """
+    print('\n[2/3] Rendering substation profiles (Red Day small multiples)…')
+
+    regions   = sorted(substations['region'].tolist())
+    n         = len(regions)
+    cols      = 4
+    rows      = (n + cols - 1) // cols
+    hours     = list(range(1, 25))
+
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(cols * 4.8, rows * 3.4),
+                             facecolor='white')
+    axes_flat = axes.flatten()
+
+    # Shared y-limits for all panels
+    all_vals = []
+    for r in regions:
+        all_vals += [loads_ctrl[RED_DAY][h].get(r, 0) for h in hours]
+        all_vals += [loads_tempo[RED_DAY][h].get(r, 0) for h in hours]
+    ymax = max(all_vals) * 1.08
+
+    for i, region in enumerate(regions):
+        ax = axes_flat[i]
+        ctrl_vals  = [loads_ctrl [RED_DAY][h].get(region, 0) for h in hours]
+        tempo_vals = [loads_tempo[RED_DAY][h].get(region, 0) for h in hours]
+
+        ax.fill_between(hours, ctrl_vals, tempo_vals,
+                        where=[t > c for t, c in zip(tempo_vals, ctrl_vals)],
+                        color=FILL_POS, alpha=0.55, zorder=1,
+                        label='_nolegend_')
+        ax.fill_between(hours, ctrl_vals, tempo_vals,
+                        where=[t < c for t, c in zip(tempo_vals, ctrl_vals)],
+                        color=FILL_NEG, alpha=0.55, zorder=1,
+                        label='_nolegend_')
+        ax.plot(hours, ctrl_vals,  color=CTRL_COLOR,  lw=1.8,
+                solid_capstyle='round', zorder=3, label='Control')
+        ax.plot(hours, tempo_vals, color=TEMPO_COLOR, lw=1.8,
+                linestyle='--', dashes=(5, 2.5),
+                solid_capstyle='round', zorder=4, label='Tempo-shifted')
+
+        ax.set_title(f'Substation {region}', fontsize=9, fontweight='semibold',
+                     color='#111111', pad=3)
+        ax.set_xlim(1, 24)
+        ax.set_ylim(0, ymax)
+        ax.set_xticks([1, 6, 12, 18, 24])
+        ax.set_xticklabels(['01:00', '06:00', '12:00', '18:00', '24:00'],
+                           fontsize=7.5)
+        ax.yaxis.set_tick_params(labelsize=7.5)
+        ax.set_xlabel('Hour of day', fontsize=8, labelpad=2)
+        ax.set_ylabel('Load (kWh)', fontsize=8, labelpad=2)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#cccccc')
+        ax.spines['bottom'].set_color('#cccccc')
+        ax.grid(axis='y', color='#eeeeee', lw=0.7)
+        ax.grid(axis='x', color='#eeeeee', lw=0.5)
+        ax.set_facecolor('#fafafa')
+
+    for j in range(n, len(axes_flat)):
+        axes_flat[j].axis('off')
+
+    # Shared legend
+    legend_handles = [
+        Line2D([0], [0], color=CTRL_COLOR,  lw=2,   label='Control'),
+        Line2D([0], [0], color=TEMPO_COLOR, lw=2,
+               linestyle='--', dashes=(5, 2.5), label='Tempo-shifted'),
+        mpatches.Patch(color=FILL_POS, alpha=0.7,
+                       label='Tempo > Control (load increase)'),
+        mpatches.Patch(color=FILL_NEG, alpha=0.7,
+                       label='Tempo < Control (load reduction)'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center',
+               ncol=4, fontsize=9, frameon=True,
+               facecolor='white', edgecolor='#cccccc',
+               bbox_to_anchor=(0.5, -0.01))
+
+    fig.suptitle(
+        f'24-Hour Substation Load Profiles  —  Red Day ({RED_DAY})\n'
+        'The Red Day is the sole day on which the tempo-shifting tariff was active.',
+        fontsize=13, fontweight='bold', y=1.02, color='#111111'
+    )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+
+    out = os.path.join(OUTPUT_DIR, '02_substation_profiles.png')
+    fig.savefig(out, dpi=180, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     print(f'  Saved → {out}')
 
 
-# ─── Output 6: Substation 24h load profiles (small multiples) ────────────────
-def make_profile_plots(substations, loads_ctrl, loads_tempo):
-    print('\n[6/6] Rendering 24h substation load profiles (small multiples)…')
-    regions   = sorted(substations['region'].tolist())
-    n_regions = len(regions)
-    cols      = 4
-    rows      = (n_regions + cols - 1) // cols
+# ─── Output 3: System-aggregate profiles — Red / White / Blue-average ─────────
+def make_system_profiles(loads_ctrl, loads_tempo):
+    """
+    Aggregate load across all 21 substations, then plot 24h profiles for:
+      Panel 1 — Red Day   (2014-07-03, tempo-shifting active)
+      Panel 2 — White Day (2014-07-02, baseline peak-ish day)
+      Panel 3 — Blue-day average (mean of all 5 blue baseline days)
 
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*4.5, rows*3.2),
-                             facecolor=BG_COLOR)
-    axes_flat = axes.flatten()
+    Each panel shows Control (solid) vs Tempo-shifted (dashed).
+    """
+    print('\n[3/3] Rendering system-aggregate profiles (3 panels)…')
 
     hours = list(range(1, 25))
 
-    for i, region in enumerate(regions):
-        ax = axes_flat[i]
-        ax.set_facecolor('#0c1622')
-        ax.spines[:].set_color(DIM_COLOR)
-        ax.tick_params(colors=TEXT_COLOR, labelsize=6.5)
+    def system_series(loads, date_or_dates):
+        """Sum across all substations per hour; average over multiple dates."""
+        if isinstance(date_or_dates, str):
+            dates = [date_or_dates]
+        else:
+            dates = list(date_or_dates)
+        arr = np.array([
+            [sum(loads[d][h].values()) for h in hours]
+            for d in dates
+        ])
+        return arr.mean(axis=0)   # shape: (24,)
 
-        ctrl_vals  = [loads_ctrl [RED_DAY][h].get(region, 0) for h in hours]
-        tempo_vals = [loads_tempo[RED_DAY][h].get(region, 0) for h in hours]
-
-        ax.plot(hours, ctrl_vals,  color='#00e676', lw=1.5, label='Control',
-                zorder=3)
-        ax.plot(hours, tempo_vals, color='#ff8c00', lw=1.5, label='Tempo-shifted',
-                linestyle='--', zorder=4)
-        ax.fill_between(hours, ctrl_vals, tempo_vals,
-                        where=[t > c for t, c in zip(tempo_vals, ctrl_vals)],
-                        alpha=0.12, color='#ff4444', zorder=2)
-        ax.fill_between(hours, ctrl_vals, tempo_vals,
-                        where=[t < c for t, c in zip(tempo_vals, ctrl_vals)],
-                        alpha=0.12, color='#4444ff', zorder=2)
-
-        ax.set_title(f'Substation {region}', color=TEXT_COLOR,
-                     fontsize=8, pad=3)
-        ax.set_xlabel('Hour', color=TEXT_COLOR, fontsize=6.5)
-        ax.set_ylabel('Load (kWh)', color=TEXT_COLOR, fontsize=6.5)
-        ax.set_xlim(1, 24)
-        ax.set_xticks(range(1, 25, 4))
-        ax.grid(color=DIM_COLOR, lw=0.4, alpha=0.7)
-
-    # Turn off unused axes
-    for j in range(n_regions, len(axes_flat)):
-        axes_flat[j].axis('off')
-
-    # Shared legend
-    from matplotlib.lines import Line2D
-    handles = [
-        Line2D([0],[0], color='#00e676', lw=2,  label='Control'),
-        Line2D([0],[0], color='#ff8c00', lw=2, linestyle='--',
-               label='Tempo-shifted'),
+    # Build data for each panel
+    panels = [
+        {
+            'label':      f'Red Day  ({RED_DAY})',
+            'sublabel':   'Tempo-shifting active',
+            'dates_ctrl':  RED_DAY,
+            'dates_tempo': RED_DAY,
+            'badge':      '#e6550d',
+            'alpha_fill':  0.45,
+        },
+        {
+            'label':      f'White Day  ({WHITE_DAY})',
+            'sublabel':   'Baseline (no tempo-shifting)',
+            'dates_ctrl':  WHITE_DAY,
+            'dates_tempo': WHITE_DAY,
+            'badge':      '#636363',
+            'alpha_fill':  0.30,
+        },
+        {
+            'label':      'Blue Days  (average)',
+            'sublabel':   f'Mean of {len(BLUE_DAYS)} baseline days',
+            'dates_ctrl':  BLUE_DAYS,
+            'dates_tempo': BLUE_DAYS,
+            'badge':      '#3182bd',
+            'alpha_fill':  0.30,
+        },
     ]
-    fig.legend(handles=handles, loc='lower right', fontsize=9,
-               facecolor='#0c1622', edgecolor=DIM_COLOR,
-               labelcolor=TEXT_COLOR, ncol=2)
 
-    fig.suptitle(f'24-Hour Load Profiles per Substation  |  Red Day ({RED_DAY})\n'
-                 'Green = Control  |  Orange dashed = Tempo-shifted  |  '
-                 'Red fill = tempo > ctrl  |  Blue fill = tempo < ctrl',
-                 color='white', fontsize=11, fontweight='bold', y=1.01)
+    # Shared y-axis scale
+    all_vals = []
+    for p in panels:
+        all_vals += list(system_series(loads_ctrl,  p['dates_ctrl']))
+        all_vals += list(system_series(loads_tempo, p['dates_tempo']))
+    ymax = max(all_vals) * 1.08
+    ymin = 0
 
-    plt.tight_layout(rect=[0, 0.02, 1, 1])
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.5), facecolor='white',
+                             sharey=True)
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.82, bottom=0.18,
+                        wspace=0.08)
 
-    out = os.path.join(OUTPUT_DIR, '06_substation_profiles.png')
-    fig.savefig(out, dpi=150, bbox_inches='tight', facecolor=BG_COLOR)
+    for ax, p in zip(axes, panels):
+        ctrl_vals  = system_series(loads_ctrl,  p['dates_ctrl'])
+        tempo_vals = system_series(loads_tempo, p['dates_tempo'])
+
+        ax.fill_between(hours, ctrl_vals, tempo_vals,
+                        where=tempo_vals > ctrl_vals,
+                        color=FILL_POS, alpha=p['alpha_fill'],
+                        zorder=1)
+        ax.fill_between(hours, ctrl_vals, tempo_vals,
+                        where=tempo_vals < ctrl_vals,
+                        color=FILL_NEG, alpha=p['alpha_fill'],
+                        zorder=1)
+        ax.plot(hours, ctrl_vals,  color=CTRL_COLOR,  lw=2.2,
+                solid_capstyle='round', zorder=3, label='Control')
+        ax.plot(hours, tempo_vals, color=TEMPO_COLOR, lw=2.2,
+                linestyle='--', dashes=(6, 3),
+                solid_capstyle='round', zorder=4, label='Tempo-shifted')
+
+        # Peak annotation on Red Day
+        if 'Red' in p['label']:
+            peak_h = int(np.argmax(ctrl_vals)) + 1   # hours are 1-indexed
+            peak_v = ctrl_vals[peak_h - 1]
+            ax.annotate(f'Peak\n{peak_v/1e6:.2f} GWh',
+                        xy=(peak_h, peak_v),
+                        xytext=(peak_h - 4, peak_v * 0.93),
+                        arrowprops=dict(arrowstyle='->', color='#555',
+                                        lw=0.9),
+                        fontsize=8, color='#333')
+
+        ax.set_xlim(1, 24)
+        ax.set_ylim(ymin, ymax)
+        ax.set_xticks([1, 6, 12, 18, 24])
+        ax.set_xticklabels(['01:00', '06:00', '12:00', '18:00', '24:00'],
+                           fontsize=8.5)
+        ax.set_xlabel('Hour of day', fontsize=9.5, labelpad=4)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#cccccc')
+        ax.spines['bottom'].set_color('#cccccc')
+        ax.grid(axis='y', color='#eeeeee', lw=0.8)
+        ax.grid(axis='x', color='#eeeeee', lw=0.5)
+        ax.set_facecolor('#fafafa')
+
+        ax.set_title(p['label'], fontsize=12, fontweight='bold',
+                     color=p['badge'], pad=6)
+        ax.text(0.5, 1.04, p['sublabel'],
+                transform=ax.transAxes, ha='center',
+                fontsize=9, color='#555555', style='italic')
+
+    axes[0].set_ylabel('Total system load (kWh)', fontsize=10, labelpad=6)
+
+    # Legend
+    legend_handles = [
+        Line2D([0], [0], color=CTRL_COLOR,  lw=2.2, label='Control'),
+        Line2D([0], [0], color=TEMPO_COLOR, lw=2.2,
+               linestyle='--', dashes=(6, 3), label='Tempo-shifted'),
+        mpatches.Patch(color=FILL_POS, alpha=0.7,
+                       label='Tempo > Control (load increase)'),
+        mpatches.Patch(color=FILL_NEG, alpha=0.7,
+                       label='Tempo < Control (load reduction)'),
+    ]
+    fig.legend(handles=legend_handles, loc='lower center',
+               ncol=4, fontsize=9.5, frameon=True,
+               facecolor='white', edgecolor='#cccccc',
+               bbox_to_anchor=(0.5, 0.01))
+
+    fig.suptitle(
+        'System-Aggregate 24-Hour Load Profile  —  Control vs. Tempo-Shifted\n'
+        '21 substations  |  28,195 households  |  July 2014  |  '
+        'Blue-day panel = mean of 5 baseline days',
+        fontsize=13, fontweight='bold', y=0.98, color='#111111'
+    )
+
+    out = os.path.join(OUTPUT_DIR, '03_system_profiles.png')
+    fig.savefig(out, dpi=180, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     print(f'  Saved → {out}')
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print('=== Distribution Network Load Visualization ===\n')
+    print('=== Distribution Network Load Visualization — Publication Edition ===\n')
 
     extract_zip()
 
@@ -601,29 +634,31 @@ def main():
     loads_ctrl  = compute_loads(nodes, ctrl_df)
     loads_tempo = compute_loads(nodes, tempo_df)
 
-    vmin, vmax = global_vmin_vmax(loads_ctrl, loads_tempo)
-    print(f'  Global load range: {vmin:.1f} – {vmax:.1f} kWh')
+    # Reproject to Web Mercator (EPSG:3857) for basemap overlay
+    print('\nReprojecting network to EPSG:3857…')
+    nodes_3857 = nodes.to_crs('EPSG:3857')
+    edges_3857 = edges.to_crs('EPSG:3857')
 
-    print('\nPre-computing edge segments…')
-    seg_map    = build_edge_segments(edges)
-    substations = extract_substations(nodes)
+    seg_map_3857  = build_edge_segments(edges_3857)
+    subs_3857     = extract_substations(nodes_3857)
+    xlim, ylim    = map_xlim_ylim(nodes_3857)
 
-    x0, x1, y0, y1 = map_extent(nodes)
-    xlim, ylim = (x0, x1), (y0, y1)
-    print(f'  Extent: lon [{x0:.3f}, {x1:.3f}]  lat [{y0:.3f}, {y1:.3f}]')
+    print('\nFetching basemap tiles…')
+    basemap_img, basemap_ext = load_basemap(nodes_3857)
 
-    # ── Generate all outputs ─────────────────────────────────────────────────
-    make_red_day_animation(seg_map, substations, loads_ctrl, loads_tempo,
-                           vmin, vmax, xlim, ylim)
-    make_daily_animation   (seg_map, substations, loads_ctrl, loads_tempo,
-                            xlim, ylim)
-    peak_hr = make_snapshots(seg_map, substations, loads_ctrl, loads_tempo,
-                             vmin, vmax, xlim, ylim)
-    make_difference_map    (seg_map, substations, loads_ctrl, loads_tempo,
-                            peak_hr, xlim, ylim)
-    make_profile_plots     (substations, loads_ctrl, loads_tempo)
+    print(f'\nMap extent (EPSG:3857):  '
+          f'x [{xlim[0]:.0f}, {xlim[1]:.0f}]  '
+          f'y [{ylim[0]:.0f}, {ylim[1]:.0f}]')
 
-    print('\n=== Done. All outputs in:', OUTPUT_DIR, '===')
+    # ── Generate outputs ─────────────────────────────────────────────────────
+    make_diff_animation(seg_map_3857, subs_3857, basemap_img, basemap_ext,
+                        loads_ctrl, loads_tempo, xlim, ylim)
+
+    make_substation_profiles(subs_3857, loads_ctrl, loads_tempo)
+
+    make_system_profiles(loads_ctrl, loads_tempo)
+
+    print('\n=== Done.  Outputs in:', OUTPUT_DIR, '===')
     for f in sorted(os.listdir(OUTPUT_DIR)):
         path = os.path.join(OUTPUT_DIR, f)
         print(f'  {f:45s}  {os.path.getsize(path)//1024:>6} KB')
