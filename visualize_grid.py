@@ -10,6 +10,9 @@ Produces:
     04_snapshot_offpeak.png         — static: off-peak hour on the red day
     05_difference_map.png           — tempo minus control at peak hour (diverging colormap)
     06_substation_profiles.png      — 24h load curves per substation, red day
+
+Data: control_profile.csv and tempo_shifted_profile.csv in data/
+      28,195 unique HIDs across 21 substations, 7 days (Jul 1-7 2014)
 """
 
 import os
@@ -34,8 +37,8 @@ warnings.filterwarnings('ignore')
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR    = '/home/user/capstone_visuals'
 ZIP_PATH    = os.path.join(BASE_DIR, 'dist_net.zip')
-CONTROL_CSV = os.path.join(BASE_DIR, 'control_profile_131.csv')
-TEMPO_CSV   = os.path.join(BASE_DIR, 'tempo_shifted_profile_131.csv')
+CONTROL_CSV = os.path.join(BASE_DIR, 'data', 'control_profile.csv')
+TEMPO_CSV   = os.path.join(BASE_DIR, 'data', 'tempo_shifted_profile.csv')
 EXTRACT_DIR = '/tmp/dist_net'
 OUTPUT_DIR  = os.path.join(BASE_DIR, 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -79,7 +82,8 @@ DAY_LABEL = {
     '2014-07-06': 'Day 6  Sun Jul 6  [blue]',
     '2014-07-07': 'Day 7  Mon Jul 7  [blue]',
 }
-RED_DAY  = '2014-07-03'
+RED_DAY   = '2014-07-03'
+WHITE_DAY = '2014-07-02'
 
 
 # ─── Step 1: Extract zip ──────────────────────────────────────────────────────
