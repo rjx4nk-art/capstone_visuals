@@ -2,50 +2,54 @@
 """
 make_arcgis_geojson.py
 ======================
-Produces two ArcGIS-ready GeoJSON files from the distribution network
-shapefiles and load-profile CSVs.
+Produces two ArcGIS-ready GeoJSON files in LONG FORMAT from the
+distribution network shapefiles and load-profile CSVs.
+
+Long format means one feature per (substation × hour) = 504 rows each.
+This lets ArcGIS's built-in Time Slider drive the animation directly.
 
 OUTPUT
 ------
-output/arcgis_substations_redday.geojson
-    21 Point features — one per substation.
+output/arcgis_substations_redday_long.geojson
+    504 Point features  (21 substations × 24 hours).
     Attributes:
-        substation_id          — region folder name (e.g. "121579")
-        diff_h01 … diff_h24   — Tempo-shifted minus Control load (kWh)
-                                  aggregated across all HID meters that
-                                  belong to this substation, for each
-                                  hour of the Red Day (2014-07-03).
+        substation_id   — region folder name (e.g. "121579")
+        timestamp       — ISO-8601 datetime "2014-07-03T01:00:00"
+                          → used as the Time Slider field in ArcGIS
+        hour            — integer 1–24 (convenience field)
+        diff_kw         — Tempo-shifted minus Control load (kWh)
+                          aggregated across all HID meters in this
+                          substation for this hour of the Red Day.
 
-output/arcgis_edges_redday.geojson
-    ~58,000 LineString features — every distribution-network edge.
-    Attributes:
-        substation_id          — which substation this edge belongs to
-        diff_h01 … diff_h24   — same values as the parent substation
-                                  (denormalized so ArcGIS can colour
-                                  edges directly without a join)
+output/arcgis_edges_redday_long.geojson
+    504 MultiLineString features  (21 substations × 24 hours).
+    Each feature contains ALL edges belonging to one substation at one
+    hour-step, so the full tree network glows together as a unit.
+    Same attributes as the substations file (timestamp, diff_kw, …).
 
 CRS: EPSG:4326 (WGS84) — required for GeoJSON.
 
-ARCGIS USAGE
-------------
-  • Add both layers via Add Data.
-  • Symbolize on any diff_hXX field with a diverging Blue–White–Red ramp:
-        Blue  = tempo-shifting reduced load
-        Red   = tempo-shifting increased load
-  • Step through hours manually, or use the Range Slider
-    (Analysis → Range → Field: diff_h01…diff_h24).
-  • To use the Time Slider instead, pivot to long format in ArcGIS:
-        Data Engineering → Transpose Fields → diff_h01…diff_h24
-        then enable Time on the resulting timestamp column.
+ARCGIS TIME SLIDER SETUP
+-------------------------
+  1. Add Data → select both .geojson files
+  2. Right-click layer → Properties → Time tab
+       Enable time on this layer: YES
+       Time Field: timestamp
+       Time Format: ISO 8601 (auto-detected)
+  3. Repeat for the other layer; link both to the same time extent.
+  4. Map tab → Time group → click the clock icon to open Time Slider.
+  5. Symbolize both layers on "diff_kw" with a diverging ramp:
+         Blue  = tempo-shifting reduced load
+         Red   = tempo-shifting increased load
+  6. Hit Play — substations and their network trees animate hour by hour.
 """
 
 import os
 import zipfile
 import warnings
-import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point, LineString
+from shapely.geometry import MultiLineString
 
 warnings.filterwarnings('ignore')
 
@@ -60,7 +64,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 RED_DAY   = '2014-07-03'
 HOUR_COLS = [str(i) for i in range(1, 25)]
-DIFF_COLS = [f'diff_h{h:02d}' for h in range(1, 25)]   # diff_h01 … diff_h24
+
+
+def normalize_hid(x):
+    try:    return str(int(float(x)))
+    except: return None
 
 
 # ─── Step 1: Extract zip ──────────────────────────────────────────────────────
@@ -94,8 +102,6 @@ def load_network():
                              geometry='geometry', crs=all_nodes[0].crs)
     edges = gpd.GeoDataFrame(pd.concat(all_edges, ignore_index=True),
                              geometry='geometry', crs=all_edges[0].crs)
-
-    # Ensure WGS84
     nodes = nodes.to_crs('EPSG:4326')
     edges = edges.to_crs('EPSG:4326')
 
@@ -104,20 +110,11 @@ def load_network():
     return nodes, edges
 
 
-def normalize_hid(x):
-    try:    return str(int(float(x)))
-    except: return None
-
-
-# ─── Step 3: Compute per-substation hourly diff on Red Day ───────────────────
-def compute_diff_by_substation(nodes):
+# ─── Step 3: Compute per-substation hourly diff (Red Day) ────────────────────
+def compute_diff(nodes):
     """
-    Returns a DataFrame:
-        substation_id | diff_h01 | diff_h02 | … | diff_h24
-    one row per substation (21 rows).
-
-    diff_hXX = Σ tempo_load(hid, h) − Σ ctrl_load(hid, h)
-               summed over all HID meters belonging to that substation.
+    Returns a dict: diff[region][hour] = float (kWh)
+    diff = sum(tempo) - sum(ctrl) across all HID meters in that substation.
     """
     print('\nLoading CSVs …')
     ctrl_df  = pd.read_csv(CONTROL_CSV)
@@ -125,143 +122,159 @@ def compute_diff_by_substation(nodes):
     ctrl_df ['hid_key'] = ctrl_df ['hid'].apply(normalize_hid)
     tempo_df['hid_key'] = tempo_df['hid'].apply(normalize_hid)
 
-    # Filter to Red Day only
-    ctrl_red  = ctrl_df [ctrl_df ['date'] == RED_DAY].copy()
-    tempo_red = tempo_df[tempo_df['date'] == RED_DAY].copy()
-    print(f'  Control  HIDs on Red Day: {ctrl_red ["hid_key"].nunique():,}')
-    print(f'  Tempo    HIDs on Red Day: {tempo_red["hid_key"].nunique():,}')
+    ctrl_red  = ctrl_df [ctrl_df ['date'] == RED_DAY]
+    tempo_red = tempo_df[tempo_df['date'] == RED_DAY]
+    print(f'  Control HIDs on Red Day: {ctrl_red ["hid_key"].nunique():,}')
+    print(f'  Tempo   HIDs on Red Day: {tempo_red["hid_key"].nunique():,}')
 
-    # Household nodes → region mapping
     hh = nodes[nodes['label'] == 'H'][['hid', 'region']].copy()
     hh['hid_key'] = hh['hid'].apply(normalize_hid)
     hh = hh.dropna(subset=['hid_key'])
 
     def region_totals(csv_red):
-        """Merge CSV → household nodes; sum load by region and hour."""
-        merged = hh.merge(csv_red[['hid_key'] + HOUR_COLS],
-                          on='hid_key', how='inner')
-        totals = merged.groupby('region')[HOUR_COLS].sum()
-        return totals   # DataFrame: region × hours
+        merged = hh.merge(csv_red[['hid_key'] + HOUR_COLS], on='hid_key', how='inner')
+        return merged.groupby('region')[HOUR_COLS].sum()
 
-    ctrl_totals  = region_totals(ctrl_red)
-    tempo_totals = region_totals(tempo_red)
+    ctrl_tot  = region_totals(ctrl_red)
+    tempo_tot = region_totals(tempo_red)
 
-    # Align on the same region index; fill missing with 0
     all_regions = sorted(nodes['region'].unique())
-    ctrl_totals  = ctrl_totals .reindex(all_regions, fill_value=0)
-    tempo_totals = tempo_totals.reindex(all_regions, fill_value=0)
+    ctrl_tot  = ctrl_tot .reindex(all_regions, fill_value=0)
+    tempo_tot = tempo_tot.reindex(all_regions, fill_value=0)
 
-    diff = tempo_totals - ctrl_totals   # element-wise difference
-    diff.columns = DIFF_COLS            # rename 1…24 → diff_h01…diff_h24
-    diff.index.name = 'substation_id'
-    diff = diff.reset_index()
+    diff_df = (tempo_tot - ctrl_tot).round(4)
 
-    print(f'\n  Diff range: '
-          f'{diff[DIFF_COLS].values.min():.2f} … '
-          f'{diff[DIFF_COLS].values.max():.2f} kWh')
-    print(f'  Non-zero substations per hour (mean): '
-          f'{(diff[DIFF_COLS] != 0).sum(axis=0).mean():.1f} / {len(diff)}')
-    return diff
+    # Convert to nested dict: diff[region][hour_int] = float
+    result = {}
+    for region in all_regions:
+        result[region] = {h: diff_df.loc[region, str(h)]
+                          for h in range(1, 25)}
+
+    vals = [v for hrs in result.values() for v in hrs.values()]
+    print(f'  Diff range: {min(vals):.2f} … {max(vals):.2f} kWh  '
+          f'(all {"≤0" if max(vals) <= 0 else "mixed"})')
+    return result
 
 
-# ─── Step 4: Build substation GeoJSON (21 Point features) ────────────────────
-def build_substation_geojson(nodes, diff_df):
-    """One Point feature per substation 'S' node with all diff columns."""
+# ─── Step 4: Build substation long-format GDF ─────────────────────────────────
+def build_substations_long(nodes, diff):
+    """
+    504 Point features — one per (substation, hour).
+    """
     subs = nodes[nodes['label'] == 'S'].copy()
-    subs = subs.rename(columns={'region': 'substation_id'})
-    subs = subs[['substation_id', 'geometry']].reset_index(drop=True)
+    subs = subs[['region', 'geometry']].rename(columns={'region': 'substation_id'})
 
-    # Merge diff values
-    subs = subs.merge(diff_df, on='substation_id', how='left')
+    rows = []
+    for _, row in subs.iterrows():
+        sid = row['substation_id']
+        for h in range(1, 25):
+            ts = f'{RED_DAY}T{h:02d}:00:00'
+            rows.append({
+                'substation_id': sid,
+                'timestamp':     ts,
+                'hour':          h,
+                'diff_kw':       diff[sid][h],
+                'geometry':      row['geometry'],
+            })
 
-    # Fill any substations with no matched HIDs with 0
-    subs[DIFF_COLS] = subs[DIFF_COLS].fillna(0.0)
-
-    # Round to 4 decimal places (sufficient for kWh)
-    subs[DIFF_COLS] = subs[DIFF_COLS].round(4)
-
-    print(f'\n  Substation features:  {len(subs)} '
-          f'(expected 21, got {len(subs)})')
-    return gpd.GeoDataFrame(subs, geometry='geometry', crs='EPSG:4326')
+    gdf = gpd.GeoDataFrame(rows, geometry='geometry', crs='EPSG:4326')
+    print(f'\n  Substation long-format features: {len(gdf)}  '
+          f'(expected {len(subs)*24} = {len(subs)} substations × 24 hours)')
+    return gdf
 
 
-# ─── Step 5: Build edge GeoJSON (~58k LineString features) ───────────────────
-def build_edge_geojson(edges, diff_df):
+# ─── Step 5: Build edge long-format GDF ──────────────────────────────────────
+def build_edges_long(edges, diff):
     """
-    All distribution edges, each tagged with its parent substation_id and
-    the same diff_h01…diff_h24 values as that substation (denormalized).
-
-    MultiLineString geometries are exploded to individual LineStrings so
-    every feature has a simple geometry — required for GeoJSON.
+    504 MultiLineString features — one per (substation, hour).
+    All edges for a substation are merged into a single MultiLineString
+    so the full tree can be coloured/animated as one unit per time step.
     """
-    edge_gdf = edges.rename(columns={'region': 'substation_id'}).copy()
-    edge_gdf = edge_gdf[['substation_id', 'geometry']].reset_index(drop=True)
+    # Collect individual LineStrings per substation
+    sub_lines = {}
+    for region, grp in edges.groupby('region'):
+        lines = []
+        for geom in grp.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            if geom.geom_type == 'LineString':
+                lines.append(geom)
+            elif geom.geom_type == 'MultiLineString':
+                lines.extend(geom.geoms)
+        sub_lines[region] = lines
 
-    # Explode MultiLineString → LineString
-    edge_gdf = edge_gdf.explode(index_parts=False).reset_index(drop=True)
+    regions = sorted(diff.keys())
+    rows = []
+    for sid in regions:
+        multi = MultiLineString(sub_lines.get(sid, []))
+        for h in range(1, 25):
+            ts = f'{RED_DAY}T{h:02d}:00:00'
+            rows.append({
+                'substation_id': sid,
+                'timestamp':     ts,
+                'hour':          h,
+                'diff_kw':       diff[sid][h],
+                'geometry':      multi,
+            })
 
-    # Merge diff values from parent substation (denormalize)
-    edge_gdf = edge_gdf.merge(diff_df, on='substation_id', how='left')
-    edge_gdf[DIFF_COLS] = edge_gdf[DIFF_COLS].fillna(0.0).round(4)
-
-    # Drop any degenerate geometries (null or empty)
-    edge_gdf = edge_gdf[~edge_gdf.geometry.is_empty & edge_gdf.geometry.notna()]
-    edge_gdf = edge_gdf.reset_index(drop=True)
-
-    print(f'  Edge features:  {len(edge_gdf):,}')
-    return gpd.GeoDataFrame(edge_gdf, geometry='geometry', crs='EPSG:4326')
+    gdf = gpd.GeoDataFrame(rows, geometry='geometry', crs='EPSG:4326')
+    print(f'  Edge long-format features:        {len(gdf)}  '
+          f'(expected {len(regions)*24} = {len(regions)} substations × 24 hours)')
+    return gdf
 
 
-# ─── Step 6: Write GeoJSON files ─────────────────────────────────────────────
+# ─── Step 6: Write GeoJSON ────────────────────────────────────────────────────
 def write_geojson(gdf, filename):
     path = os.path.join(OUTPUT_DIR, filename)
-    gdf.to_file(path, driver='GeoJSON')
+    # 6 decimal places ≈ 11 cm precision — more than adequate for visualization
+    # and keeps file size within GitHub's 100 MB limit.
+    gdf.to_file(path, driver='GeoJSON', COORDINATE_PRECISION=6)
     size_kb = os.path.getsize(path) // 1024
     print(f'  Wrote → {path}  ({len(gdf):,} features, {size_kb:,} KB)')
-    return path
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print('=== ArcGIS GeoJSON Export  —  Red Day Difference ===')
-    print(f'    Red Day: {RED_DAY}   |   Diff = Tempo-shifted − Control\n')
+    print('=== ArcGIS GeoJSON Export — Long Format  (Red Day Diff) ===')
+    print(f'    {RED_DAY}   |   diff_kw = Tempo-shifted − Control\n')
 
     extract_zip()
 
     print('\nLoading shapefiles …')
     nodes, edges = load_network()
 
-    diff_df = compute_diff_by_substation(nodes)
+    diff = compute_diff(nodes)
 
-    print('\nBuilding GeoJSON layers …')
-    sub_gdf  = build_substation_geojson(nodes, diff_df)
-    edge_gdf = build_edge_geojson(edges, diff_df)
+    print('\nBuilding long-format layers …')
+    sub_gdf  = build_substations_long(nodes, diff)
+    edge_gdf = build_edges_long(edges, diff)
 
     print('\nWriting output files …')
-    write_geojson(sub_gdf,  'arcgis_substations_redday.geojson')
-    write_geojson(edge_gdf, 'arcgis_edges_redday.geojson')
+    write_geojson(sub_gdf,  'arcgis_substations_redday_long.geojson')
+    write_geojson(edge_gdf, 'arcgis_edges_redday_long.geojson')
 
-    # ── Summary ──────────────────────────────────────────────────────────────
     print("""
 ╔══════════════════════════════════════════════════════════════════════╗
-║  ArcGIS Usage                                                        ║
+║  ArcGIS Time Slider Setup                                            ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  1. Add Data → arcgis_substations_redday.geojson                     ║
-║     Add Data → arcgis_edges_redday.geojson                           ║
+║  1. Add Data → arcgis_substations_redday_long.geojson               ║
+║     Add Data → arcgis_edges_redday_long.geojson                     ║
 ║                                                                      ║
-║  2. Symbolize → Graduated Colors → field: diff_h01 (or any hour)     ║
+║  2. Right-click each layer → Properties → Time tab                  ║
+║       Enable time on this layer: YES                                 ║
+║       Time Field: timestamp                                          ║
+║       (ArcGIS auto-detects ISO-8601 format)                         ║
+║                                                                      ║
+║  3. Map tab → Time group → open Time Slider                          ║
+║     Both layers share the same 24 hourly steps (01:00 … 24:00).     ║
+║                                                                      ║
+║  4. Symbolize → Graduated Colors → Field: diff_kw                   ║
 ║     Colour scheme: Diverging Blue–White–Red                          ║
-║       Blue  = tempo-shifting reduced load                            ║
+║       Blue  = tempo-shifting reduced load (all values here ≤ 0)     ║
 ║       Red   = tempo-shifting increased load                          ║
 ║                                                                      ║
-║  3. Step through hours:                                              ║
-║     • Manual: change the symbolization field to diff_h01…diff_h24   ║
-║     • Range Slider: Map tab → Range → Range Field → diff_h01…h24    ║
-║     • Time Slider: pivot to long format first via                    ║
-║         Data Engineering → Transpose Fields → diff_h01…diff_h24     ║
-║         then enable Time on the resulting timestamp column           ║
-║                                                                      ║
-║  4. Both layers share substation_id — join them if needed.           ║
+║  5. Hit Play.  Each step = 1 hour.  Substations and their full       ║
+║     tree networks change colour together as diff_kw varies.          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """)
 
