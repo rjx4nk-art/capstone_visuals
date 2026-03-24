@@ -141,11 +141,11 @@ for sid in substation_ids:
     sub_node.plot(
         ax=ax,
         color=color_map[sid],
-        markersize=200,
+        markersize=260,
         marker='*',
         zorder=4,
-        edgecolors='white',
-        linewidths=1.0
+        edgecolors='black',
+        linewidths=1.2
     )
 
 # OSM basemap — slightly more transparent so colored edges pop
