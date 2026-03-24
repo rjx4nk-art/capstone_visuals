@@ -30,7 +30,6 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import contextily as ctx
 
 warnings.filterwarnings('ignore')
@@ -159,30 +158,7 @@ ctx.add_basemap(
     zorder=1
 )
 
-ax.set_title(
-    'Distribution Network — Edges & Substation Nodes\n'
-    f'Total nodes: {total_nodes:,}   |   Total edges: {total_edges:,}   |   '
-    f'Substations: {n_substations}',
-    fontsize=15,
-    fontweight='bold',
-    pad=16
-)
 ax.axis('off')
-
-# Legend — spread across more columns to stay compact in widescreen layout
-legend_handles = [
-    mpatches.Patch(color=color_map[sid], label=f'Substation {sid}')
-    for sid in substation_ids
-]
-ax.legend(
-    handles=legend_handles,
-    loc='lower left',
-    fontsize=9,
-    framealpha=0.85,
-    ncol=3,
-    title='Substations',
-    title_fontsize=10
-)
 
 plt.tight_layout()
 fig.savefig(OUTPUT_PATH, dpi=150, bbox_inches='tight')
