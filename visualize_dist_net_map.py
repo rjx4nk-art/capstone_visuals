@@ -117,9 +117,11 @@ color_map = {sid: palette[i % len(palette)]
 
 # ── Step 6: Draw map ───────────────────────────────────────────────────────────
 print('\nRendering map …')
-fig, ax = plt.subplots(figsize=(14, 14))
+# 16:9 widescreen — fits a slide without cropping
+fig, ax = plt.subplots(figsize=(20, 11.25))
 
 # Edges — one layer per substation
+# Heavier linewidth so network branches read clearly at slide scale
 for sid in substation_ids:
     sub_edges = edges_wm[edges_wm['substation'] == sid]
     if sub_edges.empty:
@@ -127,8 +129,8 @@ for sid in substation_ids:
     sub_edges.plot(
         ax=ax,
         color=color_map[sid],
-        linewidth=0.7,
-        alpha=0.85,
+        linewidth=1.8,
+        alpha=0.9,
         zorder=2
     )
 
@@ -140,20 +142,20 @@ for sid in substation_ids:
     sub_node.plot(
         ax=ax,
         color=color_map[sid],
-        markersize=120,
+        markersize=200,
         marker='*',
         zorder=4,
         edgecolors='white',
-        linewidths=0.8
+        linewidths=1.0
     )
 
-# OSM basemap
+# OSM basemap — slightly more transparent so colored edges pop
 ctx.add_basemap(
     ax,
     crs=WEB_MERCATOR,
     source=ctx.providers.OpenStreetMap.Mapnik,
     zoom='auto',
-    alpha=0.55,
+    alpha=0.45,
     zorder=1
 )
 
@@ -161,13 +163,13 @@ ax.set_title(
     'Distribution Network — Edges & Substation Nodes\n'
     f'Total nodes: {total_nodes:,}   |   Total edges: {total_edges:,}   |   '
     f'Substations: {n_substations}',
-    fontsize=13,
+    fontsize=15,
     fontweight='bold',
-    pad=14
+    pad=16
 )
 ax.axis('off')
 
-# Legend
+# Legend — spread across more columns to stay compact in widescreen layout
 legend_handles = [
     mpatches.Patch(color=color_map[sid], label=f'Substation {sid}')
     for sid in substation_ids
@@ -175,11 +177,11 @@ legend_handles = [
 ax.legend(
     handles=legend_handles,
     loc='lower left',
-    fontsize=7.5,
+    fontsize=9,
     framealpha=0.85,
-    ncol=2,
+    ncol=3,
     title='Substations',
-    title_fontsize=8
+    title_fontsize=10
 )
 
 plt.tight_layout()
