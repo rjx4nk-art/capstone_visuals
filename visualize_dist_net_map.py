@@ -158,10 +158,15 @@ ctx.add_basemap(
     zorder=1
 )
 
+# geopandas sets aspect='equal' by default, which forces the tall narrow
+# network to ignore the 16:9 canvas. Override it here, after the basemap
+# is rendered, so the axes fill the full widescreen frame.
+ax.set_aspect('auto')
 ax.axis('off')
 
-plt.tight_layout()
-fig.savefig(OUTPUT_PATH, dpi=150, bbox_inches='tight')
+# Remove tight crop — let the full 16:9 canvas save as-is
+plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+fig.savefig(OUTPUT_PATH, dpi=150)
 plt.show()
 print(f'\nMap saved → {OUTPUT_PATH}')
 
